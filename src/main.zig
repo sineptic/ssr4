@@ -61,11 +61,30 @@ pub fn main(init: std.process.Init) !void {
         try display_blocks_interactive(stdout, blocks, cursor);
 
         const byte = try tty.takeByte();
-        if (byte == 4) {
-            break;
-        }
         if (blocks[cursor].is_interactive()) {
-            try blocks[cursor].eat_byte(gpa, byte);
+            blocks[cursor].eat_byte(gpa, byte) catch |err| switch (err) {
+                error.FormSubmission => {
+                    break;
+                },
+                error.GotoNextBlock => {
+                    for (blocks[cursor..], cursor..) |block, i| {
+                        if (block.is_interactive() and i > cursor) {
+                            cursor = i;
+                            break;
+                        }
+                    }
+                },
+                error.GotoPreviousBlock => {
+                    var last = cursor;
+                    for (blocks[0..cursor], 0..) |block, i| {
+                        if (block.is_interactive()) {
+                            last = i;
+                        }
+                    }
+                    cursor = last;
+                },
+                else => return err,
+            };
         }
     }
 }
@@ -75,7 +94,7 @@ const Block = union(enum) {
     hidden: struct {
         original_text: []const u8,
         user_input: std.ArrayList(u8),
-        field_cursor: usize,
+        cursor_index: usize,
     },
     note: []const u8,
 
@@ -85,16 +104,29 @@ const Block = union(enum) {
             .hidden => true,
         };
     }
+    const Error = error{
+        OutOfMemory,
+        NonUtf8Input,
+        FormSubmission,
+        GotoNextBlock,
+        GotoPreviousBlock,
+    };
     /// Block must be interactive.
-    fn eat_byte(self: *Block, gpa: std.mem.Allocator, byte: u8) !void {
+    fn eat_byte(self: *Block, gpa: std.mem.Allocator, byte: u8) Error!void {
         switch (self.*) {
             .text, .note => unreachable,
             .hidden => |*this| {
+                if (byte == 4) {
+                    return error.FormSubmission;
+                }
+                if (byte == 9) {
+                    return error.GotoNextBlock;
+                }
                 if (byte == 8 or byte == 127) {
-                    if (this.field_cursor == 0) return;
+                    if (this.cursor_index == 0) return;
                     for (0..4) |_| {
-                        const popped = this.user_input.orderedRemove(this.field_cursor - 1);
-                        this.field_cursor -= 1;
+                        const popped = this.user_input.orderedRemove(this.cursor_index - 1);
+                        this.cursor_index -= 1;
                         // if character start
                         if ((popped & 0b11000000) != 0b10000000) break;
                     } else {
@@ -102,18 +134,18 @@ const Block = union(enum) {
                     }
                     return;
                 }
-                var temp = try this.user_input.addManyAt(gpa, this.field_cursor, 1);
+                var temp = try this.user_input.addManyAt(gpa, this.cursor_index, 1);
                 temp[0] = byte;
-                this.field_cursor += 1;
+                this.cursor_index += 1;
                 // left arrow
-                if (std.mem.endsWith(u8, this.user_input.items[0..this.field_cursor], "\x1b[D")) {
-                    this.user_input.orderedRemoveMany(&.{ this.field_cursor - 3, this.field_cursor - 2, this.field_cursor - 1 });
-                    this.field_cursor -= 3;
+                if (std.mem.endsWith(u8, this.user_input.items[0..this.cursor_index], "\x1b[D")) {
+                    this.user_input.orderedRemoveMany(&.{ this.cursor_index - 3, this.cursor_index - 2, this.cursor_index - 1 });
+                    this.cursor_index -= 3;
 
-                    if (this.field_cursor > 0) {
+                    if (this.cursor_index > 0) {
                         for (0..4) |_| {
-                            const ch = this.user_input.items[this.field_cursor - 1];
-                            this.field_cursor -= 1;
+                            const ch = this.user_input.items[this.cursor_index - 1];
+                            this.cursor_index -= 1;
                             // if character start
                             if ((ch & 0b11000000) != 0b10000000) break;
                         } else {
@@ -123,38 +155,45 @@ const Block = union(enum) {
                     return;
                 }
                 // right arrow
-                if (std.mem.endsWith(u8, this.user_input.items[0..this.field_cursor], "\x1b[C")) {
-                    this.user_input.orderedRemoveMany(&.{ this.field_cursor - 3, this.field_cursor - 2, this.field_cursor - 1 });
-                    this.field_cursor -= 3;
+                if (std.mem.endsWith(u8, this.user_input.items[0..this.cursor_index], "\x1b[C")) {
+                    this.user_input.orderedRemoveMany(&.{ this.cursor_index - 3, this.cursor_index - 2, this.cursor_index - 1 });
+                    this.cursor_index -= 3;
 
-                    if (this.field_cursor < this.user_input.items.len) {
-                        const first_byte = this.user_input.items[this.field_cursor];
-                        this.field_cursor += std.unicode.utf8ByteSequenceLength(first_byte) catch {
+                    if (this.cursor_index < this.user_input.items.len) {
+                        const first_byte = this.user_input.items[this.cursor_index];
+                        this.cursor_index += std.unicode.utf8ByteSequenceLength(first_byte) catch {
                             return error.NonUtf8Input;
                         };
                     }
                     return;
                 }
-                // 'delete' key
-                if (std.mem.endsWith(u8, this.user_input.items[0..this.field_cursor], "\x1b[3~")) {
-                    this.user_input.orderedRemoveMany(&.{
-                        this.field_cursor - 4,
-                        this.field_cursor - 3,
-                        this.field_cursor - 2,
-                        this.field_cursor - 1,
-                    });
-                    this.field_cursor -= 4;
+                // back tab
+                if (std.mem.endsWith(u8, this.user_input.items[0..this.cursor_index], "\x1b[Z")) {
+                    this.user_input.orderedRemoveMany(&.{ this.cursor_index - 3, this.cursor_index - 2, this.cursor_index - 1 });
+                    this.cursor_index -= 3;
 
-                    if (this.field_cursor < this.user_input.items.len) {
-                        const first_byte = this.user_input.items[this.field_cursor];
+                    return error.GotoPreviousBlock;
+                }
+                // 'delete' key
+                if (std.mem.endsWith(u8, this.user_input.items[0..this.cursor_index], "\x1b[3~")) {
+                    this.user_input.orderedRemoveMany(&.{
+                        this.cursor_index - 4,
+                        this.cursor_index - 3,
+                        this.cursor_index - 2,
+                        this.cursor_index - 1,
+                    });
+                    this.cursor_index -= 4;
+
+                    if (this.cursor_index < this.user_input.items.len) {
+                        const first_byte = this.user_input.items[this.cursor_index];
                         const char_length = std.unicode.utf8ByteSequenceLength(first_byte) catch {
                             return error.NonUtf8Input;
                         };
                         const indexes: []const usize = &.{
-                            this.field_cursor,
-                            this.field_cursor + 1,
-                            this.field_cursor + 2,
-                            this.field_cursor + 3,
+                            this.cursor_index,
+                            this.cursor_index + 1,
+                            this.cursor_index + 2,
+                            this.cursor_index + 3,
                         };
                         this.user_input.orderedRemoveMany(indexes[0..char_length]);
                     }
@@ -192,7 +231,7 @@ fn parse_task(gpa: std.mem.Allocator, stderr: *std.Io.Writer, task: []const u8) 
             try blocks.append(gpa, .{ .hidden = .{
                 .original_text = block,
                 .user_input = .empty,
-                .field_cursor = 0,
+                .cursor_index = 0,
             } });
         } else if (next_slashes == 0) {
             const block, tail = std.mem.cut(u8, tail[2..], "\n") orelse .{ tail, &.{} };
@@ -228,8 +267,8 @@ fn display_blocks_interactive(output: *std.Io.Writer, blocks: []const Block, cur
                     try output.print("\x1b[3m<empty>\x1b[0m", .{});
                 } else {
                     try output.print("\x1b[3;4m{s}\x1b7{s}\x1b[0m", .{
-                        hidden_block.user_input.items[0..hidden_block.field_cursor],
-                        hidden_block.user_input.items[hidden_block.field_cursor..],
+                        hidden_block.user_input.items[0..hidden_block.cursor_index],
+                        hidden_block.user_input.items[hidden_block.cursor_index..],
                     });
                 }
             },
