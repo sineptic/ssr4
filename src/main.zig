@@ -22,14 +22,18 @@ pub fn main(init: std.process.Init) !void {
     const blocks = try parse_task(gpa, stderr, input);
     defer gpa.free(blocks);
 
-    const tty = try std.Io.Dir.cwd().openFile(io, "/dev/tty", .{});
-    defer tty.close(io);
+    const tty_file = try std.Io.Dir.cwd().openFile(io, "/dev/tty", .{});
+    defer tty_file.close(io);
+    var tty_buffer: [1024]u8 = undefined;
+    var tty_reader = tty_file.reader(io, &tty_buffer);
+    var tty = &tty_reader.interface;
 
-    const original_termios = try std.posix.tcgetattr(tty.handle);
-    defer std.posix.tcsetattr(tty.handle, .FLUSH, original_termios) catch {};
+    const original_termios = try std.posix.tcgetattr(tty_file.handle);
+    defer std.posix.tcsetattr(tty_file.handle, .FLUSH, original_termios) catch {};
     var termios = original_termios;
     termios.lflag.ECHO = false;
-    try std.posix.tcsetattr(tty.handle, .NOW, termios);
+    termios.lflag.ICANON = false;
+    try std.posix.tcsetattr(tty_file.handle, .NOW, termios);
 
     // enter alt screen
     try stdout.writeAll("\x1b[?1049h");
@@ -40,16 +44,27 @@ pub fn main(init: std.process.Init) !void {
         stdout.flush() catch {};
     }
 
-    var cursor: usize = 0;
-    for (blocks, 0..) |block, i| {
-        if (block.is_interactive()) {
-            cursor = i;
-            break;
+    var inp: std.ArrayList(u8) = .empty;
+    defer inp.deinit(gpa);
+    while (true) {
+        try stdout.writeAll("\x1b[2J\x1b[1;1H\x1b[0m");
+        try stdout.writeAll(inp.items);
+        try stdout.flush();
+
+        const byte = try tty.takeByte();
+        if (byte == 8 or byte == 127) {
+            if (inp.items.len == 0) continue;
+            for (0..4) |_| {
+                const popped = inp.pop().?;
+                // if character start
+                if ((popped & 0b11000000) != 0b10000000) break;
+            } else {
+                @panic("non utf-8 input");
+            }
+        } else {
+            try inp.append(gpa, byte);
         }
     }
-    try display_blocks_interactive(stdout, blocks, cursor);
-
-    try io.sleep(.fromSeconds(5), .real);
 }
 
 const Block = union(enum) {
