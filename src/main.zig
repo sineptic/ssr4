@@ -91,9 +91,9 @@ const Block = union(enum) {
             .text, .note => unreachable,
             .hidden => |*this| {
                 if (byte == 8 or byte == 127) {
-                    if (this.user_input.items.len == 0) return;
+                    if (this.field_cursor == 0) return;
                     for (0..4) |_| {
-                        const popped = this.user_input.pop().?;
+                        const popped = this.user_input.orderedRemove(this.field_cursor - 1);
                         this.field_cursor -= 1;
                         // if character start
                         if ((popped & 0b11000000) != 0b10000000) break;
@@ -102,8 +102,64 @@ const Block = union(enum) {
                     }
                     return;
                 }
-                try this.user_input.append(gpa, byte);
+                var temp = try this.user_input.addManyAt(gpa, this.field_cursor, 1);
+                temp[0] = byte;
                 this.field_cursor += 1;
+                // left arrow
+                if (std.mem.endsWith(u8, this.user_input.items[0..this.field_cursor], "\x1b[D")) {
+                    this.user_input.orderedRemoveMany(&.{ this.field_cursor - 3, this.field_cursor - 2, this.field_cursor - 1 });
+                    this.field_cursor -= 3;
+
+                    if (this.field_cursor > 0) {
+                        for (0..4) |_| {
+                            const ch = this.user_input.items[this.field_cursor - 1];
+                            this.field_cursor -= 1;
+                            // if character start
+                            if ((ch & 0b11000000) != 0b10000000) break;
+                        } else {
+                            return error.NonUtf8Input;
+                        }
+                    }
+                    return;
+                }
+                // right arrow
+                if (std.mem.endsWith(u8, this.user_input.items[0..this.field_cursor], "\x1b[C")) {
+                    this.user_input.orderedRemoveMany(&.{ this.field_cursor - 3, this.field_cursor - 2, this.field_cursor - 1 });
+                    this.field_cursor -= 3;
+
+                    if (this.field_cursor < this.user_input.items.len) {
+                        const first_byte = this.user_input.items[this.field_cursor];
+                        this.field_cursor += std.unicode.utf8ByteSequenceLength(first_byte) catch {
+                            return error.NonUtf8Input;
+                        };
+                    }
+                    return;
+                }
+                // 'delete' key
+                if (std.mem.endsWith(u8, this.user_input.items[0..this.field_cursor], "\x1b[3~")) {
+                    this.user_input.orderedRemoveMany(&.{
+                        this.field_cursor - 4,
+                        this.field_cursor - 3,
+                        this.field_cursor - 2,
+                        this.field_cursor - 1,
+                    });
+                    this.field_cursor -= 4;
+
+                    if (this.field_cursor < this.user_input.items.len) {
+                        const first_byte = this.user_input.items[this.field_cursor];
+                        const char_length = std.unicode.utf8ByteSequenceLength(first_byte) catch {
+                            return error.NonUtf8Input;
+                        };
+                        const indexes: []const usize = &.{
+                            this.field_cursor,
+                            this.field_cursor + 1,
+                            this.field_cursor + 2,
+                            this.field_cursor + 3,
+                        };
+                        this.user_input.orderedRemoveMany(indexes[0..char_length]);
+                    }
+                    return;
+                }
             },
         }
     }
