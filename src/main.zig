@@ -20,7 +20,12 @@ pub fn main(init: std.process.Init) !void {
     const input = input_buffer[0..input_n];
 
     const blocks = try parse_task(gpa, stderr, input);
-    defer gpa.free(blocks);
+    defer {
+        for (blocks) |*block| {
+            block.deinit(gpa);
+        }
+        gpa.free(blocks);
+    }
 
     const tty_file = try std.Io.Dir.cwd().openFile(io, "/dev/tty", .{});
     defer tty_file.close(io);
@@ -44,25 +49,23 @@ pub fn main(init: std.process.Init) !void {
         stdout.flush() catch {};
     }
 
-    var inp: std.ArrayList(u8) = .empty;
-    defer inp.deinit(gpa);
+    var cursor: usize = 0;
+    for (blocks, 0..) |block, i| {
+        if (block.is_interactive()) {
+            cursor = i;
+            break;
+        }
+    }
+
     while (true) {
-        try stdout.writeAll("\x1b[2J\x1b[1;1H\x1b[0m");
-        try stdout.writeAll(inp.items);
-        try stdout.flush();
+        try display_blocks_interactive(stdout, blocks, cursor);
 
         const byte = try tty.takeByte();
-        if (byte == 8 or byte == 127) {
-            if (inp.items.len == 0) continue;
-            for (0..4) |_| {
-                const popped = inp.pop().?;
-                // if character start
-                if ((popped & 0b11000000) != 0b10000000) break;
-            } else {
-                @panic("non utf-8 input");
-            }
-        } else {
-            try inp.append(gpa, byte);
+        if (byte == 4) {
+            break;
+        }
+        if (blocks[cursor].is_interactive()) {
+            try blocks[cursor].eat_byte(gpa, byte);
         }
     }
 }
@@ -71,7 +74,7 @@ const Block = union(enum) {
     text: []const u8,
     hidden: struct {
         original_text: []const u8,
-        user_input: []const u8,
+        user_input: std.ArrayList(u8),
         field_cursor: usize,
     },
     note: []const u8,
@@ -81,6 +84,36 @@ const Block = union(enum) {
             .text, .note => false,
             .hidden => true,
         };
+    }
+    /// Block must be interactive.
+    fn eat_byte(self: *Block, gpa: std.mem.Allocator, byte: u8) !void {
+        switch (self.*) {
+            .text, .note => unreachable,
+            .hidden => |*this| {
+                if (byte == 8 or byte == 127) {
+                    if (this.user_input.items.len == 0) return;
+                    for (0..4) |_| {
+                        const popped = this.user_input.pop().?;
+                        this.field_cursor -= 1;
+                        // if character start
+                        if ((popped & 0b11000000) != 0b10000000) break;
+                    } else {
+                        return error.NonUtf8Input;
+                    }
+                    return;
+                }
+                try this.user_input.append(gpa, byte);
+                this.field_cursor += 1;
+            },
+        }
+    }
+    fn deinit(self: *Block, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .text, .note => {},
+            .hidden => |*this| {
+                this.user_input.deinit(gpa);
+            },
+        }
     }
 };
 
@@ -102,7 +135,7 @@ fn parse_task(gpa: std.mem.Allocator, stderr: *std.Io.Writer, task: []const u8) 
             };
             try blocks.append(gpa, .{ .hidden = .{
                 .original_text = block,
-                .user_input = &.{},
+                .user_input = .empty,
                 .field_cursor = 0,
             } });
         } else if (next_slashes == 0) {
@@ -135,12 +168,12 @@ fn display_blocks_interactive(output: *std.Io.Writer, blocks: []const Block, cur
             },
             .note => {},
             .hidden => |hidden_block| {
-                if (hidden_block.user_input.len == 0 and i != cursor) {
+                if (hidden_block.user_input.items.len == 0 and i != cursor) {
                     try output.print("\x1b[3m<empty>\x1b[0m", .{});
                 } else {
                     try output.print("\x1b[3;4m{s}\x1b7{s}\x1b[0m", .{
-                        hidden_block.user_input[0..hidden_block.field_cursor],
-                        hidden_block.user_input[hidden_block.field_cursor..],
+                        hidden_block.user_input.items[0..hidden_block.field_cursor],
+                        hidden_block.user_input.items[hidden_block.field_cursor..],
                     });
                 }
             },
