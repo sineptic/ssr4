@@ -31,7 +31,7 @@ pub fn main(init: std.process.Init) !void {
     defer tty_file.close(io);
     var tty_buffer: [1024]u8 = undefined;
     var tty_reader = tty_file.reader(io, &tty_buffer);
-    var tty = &tty_reader.interface;
+    const tty = &tty_reader.interface;
 
     const original_termios = try std.posix.tcgetattr(tty_file.handle);
     defer std.posix.tcsetattr(tty_file.handle, .FLUSH, original_termios) catch {};
@@ -49,6 +49,24 @@ pub fn main(init: std.process.Init) !void {
         stdout.flush() catch {};
     }
 
+    const difficulty = try repeat_task(gpa, stdout, tty, tty_file, blocks);
+    std.debug.panic("difficulty: {}", .{difficulty});
+}
+
+const RepetitionDifficulty = enum {
+    again,
+    hard,
+    good,
+    easy,
+};
+/// Repeat task and return difficulty
+fn repeat_task(
+    gpa: std.mem.Allocator,
+    stdout: *std.Io.Writer,
+    tty: *std.Io.Reader,
+    tty_file: std.Io.File,
+    blocks: []Block,
+) !RepetitionDifficulty {
     var cursor: usize = 0;
     for (blocks, 0..) |block, i| {
         if (block.is_interactive()) {
@@ -56,10 +74,11 @@ pub fn main(init: std.process.Init) !void {
             break;
         }
     }
-
     while (true) {
         try display_blocks_interactive(stdout, blocks, cursor);
 
+        // TODO: Also consume all availble in buffer bytes.
+        // NOTE: Availability could be checked using `tty.bufferedLen()`
         const byte = try tty.takeByte();
         if (blocks[cursor].is_interactive()) {
             blocks[cursor].eat_byte(gpa, byte) catch |err| switch (err) {
@@ -85,6 +104,17 @@ pub fn main(init: std.process.Init) !void {
                 },
                 else => return err,
             };
+        }
+    }
+    try display_blocks_answer_overview(stdout, tty_file, blocks);
+    while (true) {
+        const byte = try tty.takeByte();
+        switch (byte) {
+            '1' => return .again,
+            '2' => return .hard,
+            '3' => return .good,
+            '4' => return .easy,
+            else => {},
         }
     }
 }
@@ -139,7 +169,11 @@ const Block = union(enum) {
                 this.cursor_index += 1;
                 // left arrow
                 if (std.mem.endsWith(u8, this.user_input.items[0..this.cursor_index], "\x1b[D")) {
-                    this.user_input.orderedRemoveMany(&.{ this.cursor_index - 3, this.cursor_index - 2, this.cursor_index - 1 });
+                    this.user_input.orderedRemoveMany(&.{
+                        this.cursor_index - 3,
+                        this.cursor_index - 2,
+                        this.cursor_index - 1,
+                    });
                     this.cursor_index -= 3;
 
                     if (this.cursor_index > 0) {
@@ -156,7 +190,11 @@ const Block = union(enum) {
                 }
                 // right arrow
                 if (std.mem.endsWith(u8, this.user_input.items[0..this.cursor_index], "\x1b[C")) {
-                    this.user_input.orderedRemoveMany(&.{ this.cursor_index - 3, this.cursor_index - 2, this.cursor_index - 1 });
+                    this.user_input.orderedRemoveMany(&.{
+                        this.cursor_index - 3,
+                        this.cursor_index - 2,
+                        this.cursor_index - 1,
+                    });
                     this.cursor_index -= 3;
 
                     if (this.cursor_index < this.user_input.items.len) {
@@ -169,7 +207,11 @@ const Block = union(enum) {
                 }
                 // back tab
                 if (std.mem.endsWith(u8, this.user_input.items[0..this.cursor_index], "\x1b[Z")) {
-                    this.user_input.orderedRemoveMany(&.{ this.cursor_index - 3, this.cursor_index - 2, this.cursor_index - 1 });
+                    this.user_input.orderedRemoveMany(&.{
+                        this.cursor_index - 3,
+                        this.cursor_index - 2,
+                        this.cursor_index - 1,
+                    });
                     this.cursor_index -= 3;
 
                     return error.GotoPreviousBlock;
@@ -235,7 +277,7 @@ fn parse_task(gpa: std.mem.Allocator, stderr: *std.Io.Writer, task: []const u8) 
             } });
         } else if (next_slashes == 0) {
             const block, tail = std.mem.cut(u8, tail[2..], "\n") orelse .{ tail, &.{} };
-            try blocks.append(gpa, .{ .note = block });
+            try blocks.append(gpa, .{ .note = std.mem.trim(u8, block, " \t") });
         } else {
             const plain_text_end = std.mem.min(
                 usize,
@@ -262,13 +304,13 @@ fn display_blocks_interactive(output: *std.Io.Writer, blocks: []const Block, cur
                 try output.print("{s}", .{string});
             },
             .note => {},
-            .hidden => |hidden_block| {
-                if (hidden_block.user_input.items.len == 0 and i != cursor) {
+            .hidden => |this| {
+                if (this.user_input.items.len == 0 and i != cursor) {
                     try output.print("\x1b[3m<empty>\x1b[0m", .{});
                 } else {
                     try output.print("\x1b[3;4m{s}\x1b7{s}\x1b[0m", .{
-                        hidden_block.user_input.items[0..hidden_block.cursor_index],
-                        hidden_block.user_input.items[hidden_block.cursor_index..],
+                        this.user_input.items[0..this.cursor_index],
+                        this.user_input.items[this.cursor_index..],
                     });
                 }
             },
@@ -278,6 +320,67 @@ fn display_blocks_interactive(output: *std.Io.Writer, blocks: []const Block, cur
         try output.writeAll("\x1b8\x1b[?25h");
     } else {
         try output.writeAll("\x1b[?25l");
+    }
+
+    try output.flush();
+}
+
+fn display_blocks_answer_overview(
+    output: *std.Io.Writer,
+    tty_file: std.Io.File,
+    blocks: []const Block,
+) !void {
+    try output.writeAll("\x1b[2J\x1b[1;1H\x1b[0m\x1b[?25l");
+
+    for (blocks) |block| {
+        switch (block) {
+            .text => |string| {
+                try output.print("{s}", .{string});
+            },
+            .note => |string| {
+                try output.print("\x1b[2m{s}\n\x1b[0m", .{string});
+            },
+            .hidden => |this| {
+                if (this.original_text.len == 0) {
+                    try output.print("\x1b[3;32m<empty>\x1b[0m", .{});
+                } else {
+                    try output.print("\x1b[3;4;32m{s}\x1b[0m", .{this.original_text});
+                }
+
+                const user_input_trimmed = std.mem.trim(u8, this.user_input.items, " \n");
+                const original_text_trimmed = std.mem.trim(u8, this.original_text, " \n");
+                if (!std.mem.eql(u8, user_input_trimmed, original_text_trimmed)) {
+                    // TODO: Separate by newline when any of them is multiline.
+                    try output.writeAll(" ");
+                    if (user_input_trimmed.len == 0) {
+                        try output.writeAll("\x1b[3;33m<empty>\x1b[0m");
+                    } else {
+                        try output.print("\x1b[3;4;33m{s}\x1b[0m", .{this.user_input.items});
+                    }
+                }
+            },
+        }
+    }
+    var winsize: std.posix.winsize = undefined;
+    const rc = std.c.ioctl(
+        tty_file.handle,
+        std.c.T.IOCGWINSZ,
+        &winsize,
+    );
+    if (rc != 0) return error.FailedToGetWinsize;
+
+    const difficulty_art: []const []const u8 = &.{
+        "╭──────────┬─────────┬─────────┬─────────╮",
+        "│ \x1b[31m1. again\x1b[0m │ \x1b[33m2. hard\x1b[0m │ \x1b[36m3. good\x1b[0m │ \x1b[32m4. easy\x1b[0m │",
+        "╰──────────┴─────────┴─────────┴─────────╯",
+    };
+    const difficulty_art_width = 42;
+    for (difficulty_art, 0..) |line, i| {
+        try output.print("\x1b[{};{}H", .{
+            winsize.row - 4 + i,
+            (winsize.col - difficulty_art_width) / 2 + 1,
+        });
+        try output.print("{s}\n", .{line});
     }
 
     try output.flush();
