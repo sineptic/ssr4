@@ -82,6 +82,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.root_module.addCSourceFile(.{ .file = b.path("bundled/sqlite3/sqlite3.c") });
+    exe.root_module.addIncludePath(b.path("bundled/sqlite3/"));
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default

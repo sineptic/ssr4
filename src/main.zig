@@ -1,10 +1,36 @@
 const std = @import("std");
-
+const sqlite3 = @cImport({
+    @cInclude("sqlite3.h");
+});
 const ssr4 = @import("ssr4");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
+
+    var db: ?*sqlite3.sqlite3 = undefined;
+    _ = sqlite3.sqlite3_open("ssr4.db", &db);
+    defer _ = sqlite3.sqlite3_close(db);
+    var stmt: ?*sqlite3.sqlite3_stmt = undefined;
+    _ = sqlite3.sqlite3_prepare_v2(db, "SELECT a, b FROM tasks", -1, &stmt, 0);
+    defer _ = sqlite3.sqlite3_finalize(stmt);
+    while (sqlite3.sqlite3_step(stmt) == sqlite3.SQLITE_ROW) {
+        const my_type = struct {
+            a: []const u8,
+            b: i32,
+        };
+        const a_raw = sqlite3.sqlite3_column_text(stmt, 0);
+        const a_len = std.zig.c_translation.builtins.strlen(a_raw);
+        const a = a_raw[0..a_len];
+        const b = sqlite3.sqlite3_column_int(stmt, 1);
+        const val =
+            my_type{
+                .a = a,
+                .b = b,
+            };
+        std.debug.print("row: {any}\n", .{val});
+    }
+    std.debug.panic("asdf", .{});
 
     var stdout_buffer: [1024]u8 = undefined;
     var stderr_buffer: [1024]u8 = undefined;
