@@ -3,34 +3,14 @@ const sqlite3 = @cImport({
     @cInclude("sqlite3.h");
 });
 const ssr4 = @import("ssr4");
+const assert = std.debug.assert;
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
-
-    var db: ?*sqlite3.sqlite3 = undefined;
-    _ = sqlite3.sqlite3_open("ssr4.db", &db);
-    defer _ = sqlite3.sqlite3_close(db);
-    var stmt: ?*sqlite3.sqlite3_stmt = undefined;
-    _ = sqlite3.sqlite3_prepare_v2(db, "SELECT a, b FROM tasks", -1, &stmt, 0);
-    defer _ = sqlite3.sqlite3_finalize(stmt);
-    while (sqlite3.sqlite3_step(stmt) == sqlite3.SQLITE_ROW) {
-        const my_type = struct {
-            a: []const u8,
-            b: i32,
-        };
-        const a_raw = sqlite3.sqlite3_column_text(stmt, 0);
-        const a_len = std.zig.c_translation.builtins.strlen(a_raw);
-        const a = a_raw[0..a_len];
-        const b = sqlite3.sqlite3_column_int(stmt, 1);
-        const val =
-            my_type{
-                .a = a,
-                .b = b,
-            };
-        std.debug.print("row: {any}\n", .{val});
-    }
-    std.debug.panic("asdf", .{});
+    const args = try init.minimal.args.toSlice(gpa);
+    // FIXME: Why it is required by .toSlice, that allocator is arena style?
+    defer gpa.free(args);
 
     var stdout_buffer: [1024]u8 = undefined;
     var stderr_buffer: [1024]u8 = undefined;
@@ -40,6 +20,14 @@ pub fn main(init: std.process.Init) !void {
     var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
     const stdout = &stdout_writer.interface;
     const stderr = &stderr_writer.interface;
+
+    assert(args.len > 0);
+    if (args.len == 1) {
+        try stderr.writeAll("Calling app without arguments is currently unsupported.\n");
+        try stderr.flush();
+        return error.UnsupportedMode;
+    }
+
     const input_buffer = try gpa.alloc(u8, 10_000);
     defer gpa.free(input_buffer);
     const input_n = try stdin_reader.interface.readSliceShort(input_buffer);
@@ -52,31 +40,115 @@ pub fn main(init: std.process.Init) !void {
         }
         gpa.free(blocks);
     }
+    if (std.mem.eql(u8, args[1], "preview")) {
+        const tty_file = try std.Io.Dir.cwd().openFile(io, "/dev/tty", .{});
+        defer tty_file.close(io);
+        var tty_buffer: [1024]u8 = undefined;
+        var tty_reader = tty_file.reader(io, &tty_buffer);
+        const tty = &tty_reader.interface;
 
-    const tty_file = try std.Io.Dir.cwd().openFile(io, "/dev/tty", .{});
-    defer tty_file.close(io);
-    var tty_buffer: [1024]u8 = undefined;
-    var tty_reader = tty_file.reader(io, &tty_buffer);
-    const tty = &tty_reader.interface;
+        const original_termios = try std.posix.tcgetattr(tty_file.handle);
+        defer std.posix.tcsetattr(tty_file.handle, .FLUSH, original_termios) catch {};
+        var termios = original_termios;
+        termios.lflag.ECHO = false;
+        termios.lflag.ICANON = false;
+        try std.posix.tcsetattr(tty_file.handle, .NOW, termios);
 
-    const original_termios = try std.posix.tcgetattr(tty_file.handle);
-    defer std.posix.tcsetattr(tty_file.handle, .FLUSH, original_termios) catch {};
-    var termios = original_termios;
-    termios.lflag.ECHO = false;
-    termios.lflag.ICANON = false;
-    try std.posix.tcsetattr(tty_file.handle, .NOW, termios);
+        // enter alt screen
+        try stdout.writeAll("\x1b[?1049h");
+        try stdout.flush();
+        defer {
+            // exit alt screen
+            stdout.writeAll("\x1b[?1049l") catch {};
+            stdout.flush() catch {};
+        }
 
-    // enter alt screen
-    try stdout.writeAll("\x1b[?1049h");
-    try stdout.flush();
-    defer {
-        // exit alt screen
-        stdout.writeAll("\x1b[?1049l") catch {};
-        stdout.flush() catch {};
+        const difficulty = try repeat_task(gpa, stdout, tty, tty_file, blocks);
+        std.debug.panic("difficulty: {}", .{difficulty});
     }
+    if (std.mem.eql(u8, args[1], "add")) {
+        var db: ?*sqlite3.sqlite3 = undefined;
+        _ = sqlite3.sqlite3_open("ssr4.db", &db);
+        defer _ = sqlite3.sqlite3_close(db);
+        {
+            var errmsg: [*c]u8 = undefined;
+            const res = sqlite3.sqlite3_exec(
+                db,
+                \\PRAGMA journal_mode = WAL;
+                \\
+                \\CREATE TABLE IF NOT EXISTS tasks (
+                \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                \\  text TEXT,
+                \\  creation_time TEXT
+                \\);
+            ,
+                null,
+                undefined,
+                &errmsg,
+            );
+            if (res != 0) {
+                const ermsg_len = std.zig.c_translation.builtins.strlen(errmsg);
+                defer sqlite3.sqlite3_free(errmsg);
+                std.debug.print("err: {s}\n", .{errmsg[0..ermsg_len]});
+                return error.CantCreateTable;
+            }
+        }
 
-    const difficulty = try repeat_task(gpa, stdout, tty, tty_file, blocks);
-    std.debug.panic("difficulty: {}", .{difficulty});
+        var stmt: ?*sqlite3.sqlite3_stmt = undefined;
+        {
+            const rc = sqlite3.sqlite3_prepare_v2(
+                db,
+                "INSERT INTO tasks (text, creation_time) VALUES (?, datetime('now', 'localtime'))",
+                10 * 1024,
+                &stmt,
+                0,
+            );
+            if (rc != 0) {
+                const errmsg = sqlite3.sqlite3_errmsg(db);
+                const errmsg_len = std.zig.c_translation.builtins.strlen(errmsg);
+                std.debug.print("err: {s}\n", .{errmsg[0..errmsg_len]});
+                @panic("TODO");
+            }
+        }
+        defer _ = sqlite3.sqlite3_finalize(stmt);
+        {
+            const SQLITE_TRANSIENT: *anyopaque = @ptrFromInt(0xFFFFFFFFFFFFFFFF);
+            const rc = sqlite3.sqlite3_bind_text(
+                stmt,
+                1,
+                input.ptr,
+                @intCast(input.len),
+                SQLITE_TRANSIENT,
+            );
+            if (rc != 0) @panic("TODO");
+        }
+        {
+            const rc = sqlite3.sqlite3_step(stmt);
+            if (rc != sqlite3.SQLITE_DONE) @panic("TODO");
+        }
+        std.debug.print("row added\n", .{});
+
+        // var stmt: ?*sqlite3.sqlite3_stmt = undefined;
+        // _ = sqlite3.sqlite3_prepare_v2(db, "SELECT a, b FROM tasks", -1, &stmt, 0);
+        // defer _ = sqlite3.sqlite3_finalize(stmt);
+        // while (sqlite3.sqlite3_step(stmt) == sqlite3.SQLITE_ROW) {
+        //     const my_type = struct {
+        //         a: []const u8,
+        //         b: i32,
+        //     };
+        //     const a_raw = sqlite3.sqlite3_column_text(stmt, 0);
+        //     const a_len = std.zig.c_translation.builtins.strlen(a_raw);
+        //     const a = a_raw[0..a_len];
+        //     const b = sqlite3.sqlite3_column_int(stmt, 1);
+        //     const val =
+        //         my_type{
+        //             .a = a,
+        //             .b = b,
+        //         };
+        //     std.debug.print("row: {any}\n", .{val});
+        // }
+        // std.debug.panic("asdf", .{});
+    }
 }
 
 const RepetitionDifficulty = enum {
